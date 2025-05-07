@@ -1,0 +1,244 @@
+---
+title: "1_QCFilter"
+output: html_document
+date: "2025-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#Load packages
+```{r}
+library(dplyr)
+library(vcfR)
+library(adegenet)
+library(data.table)
+```
+
+
+#Step 1: Load VCF and fix sample names 
+```{r}
+# Read VCF file and population map
+vcf <- read.vcfR("CAGRF24080074-2_variants_shortened.vcf")
+pop_map <- read.table("strata.tsv", header=TRUE, stringsAsFactors = TRUE)
+
+# Rename sample columns: keep only first two elements before dashes
+sample_names <- colnames(vcf@gt)[-1]  # Exclude FORMAT column
+shortened_names <- sub("^([^-]+-[^-]+).*", "\\1", sample_names)
+colnames(vcf@gt)[-1] <- shortened_names
+```
+
+#Step 2: Convert genotypes to numeric format
+```{r}
+# Extract genotype data from VCF
+gt <- extract.gt(vcf, element = "GT", as.numeric = FALSE)
+
+# Convert genotype strings to numeric
+geno_num <- matrix(NA, nrow = nrow(gt), ncol = ncol(gt))
+for (i in 1:nrow(gt)) {
+  for (j in 1:ncol(gt)) {
+    g <- gt[i, j]
+    if (g %in% c("0/0", "0|0")) geno_num[i, j] <- 0
+    else if (g %in% c("0/1", "1/0", "0|1", "1|0")) geno_num[i, j] <- 1
+    else if (g %in% c("1/1", "1|1")) geno_num[i, j] <- 2
+    else geno_num[i, j] <- NA
+  }
+}
+```
+
+
+Step 3: Filter loci by missing data and MAF 
+```{r}
+# Keep loci with ≤20% missing data
+missing_per_locus <- apply(geno_num, 1, function(x) mean(is.na(x)))
+keep_loci_miss <- which(missing_per_locus <= 0.2)
+
+# Keep loci with MAF ≥ 0.05
+maf <- apply(geno_num, 1, function(x) {
+  x <- x[!is.na(x)]
+  p <- mean(x) / 2
+  min(p, 1 - p)
+})
+keep_loci_maf <- which(maf >= 0.05)
+
+# Apply locus filters
+keep_loci <- intersect(keep_loci_miss, keep_loci_maf)
+vcf_loci_filtered <- vcf[keep_loci, ]
+```
+
+
+Step 4: Filter individuals by missing data
+```{r}
+# Re-extract the genotype matrix after filtering
+gt_filtered <- extract.gt(vcf_loci_filtered, element = "GT", as.numeric = FALSE)
+
+# Filter by missing data per individual
+missing_per_ind <- apply(gt_filtered, 2, function(x) mean(is.na(x)))
+keep_inds <- names(missing_per_ind[missing_per_ind <= 0.5])
+
+# Keep only the selected individuals and FORMAT column
+vcf_final <- vcf_loci_filtered[, c(TRUE, colnames(gt_filtered) %in% keep_inds)]
+```
+
+
+Step 5: Convert to genind object
+```{r}
+# Convert the filtered VCF to a genind object
+acro_gen <- vcfR2genind(vcf_final)
+```
+
+
+Step 6: Read and merge metadata
+```{r}
+# Read metadata file and adjust SampleID column for merging
+acro_meta <- read.csv("Acro_Meta2024.csv") %>%
+  rename(SampleID = VialID)
+
+# Match and merge metadata
+inds <- indNames(acro_gen)
+meta_trimmed <- merge(data.table(SampleID = inds), acro_meta, by = "SampleID", all.x = TRUE)
+meta_trimmed <- meta_trimmed[match(inds, meta_trimmed$SampleID), ]
+
+# Add population info (STRATA) to genind
+acro_gen@pop <- as.factor(meta_trimmed$STRATA)
+
+# Optionally, read and reassign population map if needed
+pop_map <- read.table("strata.tsv", header=TRUE, stringsAsFactors = TRUE)
+acro_gen@pop <- pop_map$STRATA
+```
+
+Step 7: Filter out individuals 
+```{r}
+# Exclude problematic individuals directly from acro_gen and population map
+acro_gen <- acro_gen[!indNames(acro_gen) %in% c("A220-24", "A243-24", "A216-20")]
+pop_map <- pop_map %>%
+  filter(!INDIVIDUALS %in% c("A220-24", "A243-24", "A216-20"))
+```
+
+#Step 8: Save filtered data
+```{r}
+# Save the filtered genind object
+saveRDS(acro_gen, "acro_gen_filtered_named.rds")
+
+# View the genind object
+acro_gen
+
+#379 individuals, 19,097 loci, 38,371 alleles 
+```
+
+
+Step 9: PCA analysis
+```{r}
+# Prepare genotype data for PCA
+x = tab(acro_gen, NA.method = "mean")
+
+# Perform PCA
+pca1 = dudi.pca(x, scannf = FALSE, scale = FALSE, nf = 3)
+
+# Analyze how much genetic variance is explained by each axis
+percent = pca1$eig / sum(pca1$eig) * 100
+barplot(percent, ylab = "Genetic variance explained by eigenvectors (%)", ylim = c(0,25), 
+        names.arg = round(percent, 1))
+```
+
+```{r}
+# Get PCA coordinates for individuals
+ind_coords <- as.data.frame(pca1$li)
+
+# Add individual names
+ind_coords$ind <- rownames(ind_coords)
+
+# Add population info from genind object
+# Extract population info in the correct order
+pops <- acro_gen@pop[match(rownames(pca1$li), indNames(acro_gen))]
+```
+
+```{r}
+ind_coords <- as.data.frame(pca1$li)
+ind_coords$ind <- rownames(ind_coords)
+ind_coords$pop <- pops
+```
+
+
+```{r}
+library(ggplot2)
+library(viridis)
+
+ggplot(ind_coords, aes(x = Axis1, y = Axis2, color = pop)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_viridis_d(option = "D") +
+  labs(
+    x = paste0("PC1 (", round(pca1$eig[1] / sum(pca1$eig) * 100, 1), "%)"),
+    y = paste0("PC2 (", round(pca1$eig[2] / sum(pca1$eig) * 100, 1), "%)"),
+    color = "Population"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid = element_blank())
+
+```
+
+
+```{r}
+# Merge latitude into the PCA coordinate dataframe
+ind_coords <- ind_coords %>%
+  left_join(meta_trimmed[, c("SampleID", "GPS.S", "GPS.E")], by = c("ind" = "SampleID"))
+```
+
+
+
+```{r}
+library(wesanderson)
+library(ggplot2)
+library(wesanderson)
+
+# Pick your fave Wes Anderson palette (e.g., "Darjeeling1", "Zissou1", "Moonrise1", etc.)
+palette <- wes_palette("Zissou1", n = 100, type = "continuous")
+
+ggplot(ind_coords, aes(x = Axis1, y = Axis2, color = GPS.S)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_gradientn(colors = palette) +
+  geom_hline(yintercept = 0, color = "gray30", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "gray30", linewidth = 0.3) +
+  labs(
+    x = paste0("PC1 (", round(pca1$eig[1] / sum(pca1$eig) * 100, 1), "%)"),
+    y = paste0("PC2 (", round(pca1$eig[2] / sum(pca1$eig) * 100, 1), "%)"),
+    color = "Latitude"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.5)
+  )
+
+```
+
+
+```{r}
+library(ggplot2)
+library(wesanderson)
+
+# Pick your fave Wes Anderson palette (e.g., "Darjeeling1", "Zissou1", "Moonrise1", etc.)
+palette <- wes_palette("Cavalcanti1", n = 100, type = "continuous")
+
+ggplot(ind_coords, aes(x = Axis1, y = Axis2, color = GPS.E)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_gradientn(colors = palette) +
+  geom_hline(yintercept = 0, color = "gray30", linewidth = 0.3) +
+  geom_vline(xintercept = 0, color = "gray30", linewidth = 0.3) +
+  labs(
+    x = paste0("PC1 (", round(pca1$eig[1] / sum(pca1$eig) * 100, 1), "%)"),
+    y = paste0("PC2 (", round(pca1$eig[2] / sum(pca1$eig) * 100, 1), "%)"),
+    color = "Longitude"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.5)
+  )
+
+```
+
+
+
